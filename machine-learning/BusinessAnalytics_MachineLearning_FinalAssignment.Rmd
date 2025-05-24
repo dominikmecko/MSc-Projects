@@ -1,0 +1,951 @@
+---
+title: "Exploratory Analysis and Predictive Modeling of COVID-19 Test Results in Israel"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Required libraries
+library(tidyverse)
+library(xray)
+library(psych)
+library(lubridate)
+library(cowplot)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(rsample)
+library(gmodels)
+library(nnet)
+library(doParallel)
+
+# Load data into memory
+#wd <- # this code is omitted in the final export of the data to ensure proper anonymisation of the assignment
+covid_data <- read_csv('corona_tested_individuals_ver_006.english.csv')
+```
+
+# Introduction
+
+This notebook contains the exploratory analysis and predictive modeling of COVID-19 test results and sickness symptom. It uses the COVID-19 Symptoms dataset sourced from the Israeli Ministry of Health.
+
+Since we will be predicting the outcome of a medical test, we are facing a **classification** task. That means the outcome we predict is binary (positive/negative).
+
+## Predictive Questions
+
+The first hypothesis will aim to explore the possibility of predicting COVID test results just from five simple symptoms. It is, however, unlikely this hypothesis will not be rejected as COVID symptoms are similar to those of common cold.
+
+$$
+H_1: Can\: simple\: symptoms\: be\: used\: to\: predict\: positive\: COVID\: test\: results\: with\: sensitivity\: ≥\: 90\: \%? 
+$$
+
+However, it is possible that including additional explanatory variables will help the accuracy of the model, therefore the second hypothesis:
+
+$$
+H_2: Do\: additional \:independent \:variables \:in \:the \:dataset \:increase \:baseline \:sensitivity?
+$$
+
+It is also possible that there is some seasonal variation, for example, there might be more positives on Mondays due to less testing over the weekend or meeting more people on Fridays. 
+
+$$
+H_3: Are\: there\: any\: seasonal\: effects\:?
+$$
+
+## Exploratory Questions
+
+Exploratory questions are focused around predictive questions. They are divided into three categories, depending on the examined variables: symptoms, seasonal patterns and demographics.
+
+### Symptoms Analysis
+
+The operational hypothesis is that some symptoms have a higher predictive power than others that are more common acorss diseases (for example, caused by immunity system activation such as fever), or that a specific combination or number of symptoms have an effect on being positively tested, therefore two exploratory questions:
+
+$$
+Q_1: Which\: symptoms\: are\: most\: common\: among\: positively\: tested\: and\: do\: they\: differ\: from\: negatively\: tested?
+$$
+
+$$
+Q_2: Does\: having\: at\: least\: two\: or\: three\: symptoms\: affect\: symptoms\: occurence\: between\: positive\: and\: negative\: tests?
+$$
+
+### Seasonal Patterns 
+
+Secondly, it is possible that a seasonal pattern affects positivity rate or the absolute number of positives. However, as we will see, the dataset can only be aggreagted to days of week. Therefore, the questions explore the weekly seasonal pattern.
+
+$$
+Q_3: Do\: symptoms\: in\: positive\: results\: change\: over\: days\: of\: the\: week?
+$$
+
+$$
+Q_4: Do\: infection\: rates\: change\: over\: days\: of\: the\: week?
+$$
+
+
+### Demographic Patterns 
+
+Lastly, demographic patterns are examined. The hypotheses are that older people can have a higher number and more severe symptoms or that the positivity differs between genders. In addition, the reason for being tested (travelling, contact with infected) will surely affect the test result. The questions are thus:
+
+$$
+Q_5: Is\: positivity\: rate\: different\: between\: age \:groups \:and \:genders?
+$$
+
+$$
+Q_6: Does\: percentage\: of\: positive\: tests\: differ\: based\: on\: reason\: to\: test\:?
+$$
+
+
+For quick navigation, you can use contents:
+
+1.  [Data Processing]
+2.  [Exploratory Analysis]
+3.  [Predictive Model]
+4.  [Conclusions]
+5.  [References]
+
+# Data Processing
+
+Before doing any processing, let's start with having a glimpse of the raw data, see unique values in categorical columns and xray for any problematic variables and distributions.
+
+```{r}
+glimpse(covid_data)
+```
+
+```{r}
+# Show unique values for each column, encode test date as categorical variables
+unique_values <- covid_data %>%
+                  mutate(day_of_week = weekdays(test_date), # encode days
+                  month_of_year = month(test_date, label = TRUE), # encode months
+                  year = year(test_date)) %>%
+                  dplyr::select(-c(test_date) )%>% # exlude date variable
+                  sapply(unique)
+unique_values
+```
+
+We can see that the dataset contains 10 variables:
+
+1.  `test_date` : date when the test was conducted, tests were done only in April and March 2020, so the only date-related variable we can extract is the day of the week
+2.  `cough`, `fever`, `sore_throat`, `shortness_of_breath`, `head_ache` : binary variables (1/0) indicating whether the tested patient experienced these symptoms
+3. `corona_result` : **target predictor** variable indicating the test result outcome, "Other" likely meaning invalid test result
+4. `age_60_and_above`: variable for age being >=60
+5. `gender`:  variable indicating gender
+6. `test_indication`: categorical variable indicating whether the tested patient had contact with infected or traveled abroad or other reason for testing. 
+
+Because we are seeing mostly categorical variables, a more useful way of analysing problematic variables is to plot distributions of our variables. 
+
+```{r, warning=FALSE, echo=FALSE}
+xray::distributions(covid_data)
+```
+
+#### Observations
+
+There are several data processing steps that will be followed based on the initial data scanning:
+
+- date column will be translated to the day of the week
+- all rows where there are missing, NA, or 'Other' or 'None' values in the following columns: `cough`, `fever`, `sore_throat`, `shortness_of_breath`, `head_ache`, `gender` will be removed
+- values 'Other' in `corona_result` will be removed
+- we cannot drop 'None' value of `gender`columns for the baseline prediction, as it is a lot of rows but a model including this variable filtered will also be fit
+- categorical variables will be translated into factors
+- count of symptoms will be created
+- drop `date` column as it provides no value
+
+```{r}
+# Data Processing
+# Create new column for day of the week
+covid_data_dates <- covid_data %>%
+    mutate(day_of_week = weekdays(test_date))
+
+# Filter missing and inappropriate values for selected columns
+# Define columns to check 
+columns_to_check <- c("cough", "fever", "sore_throat", "shortness_of_breath", "head_ache", "corona_result", "gender")
+
+# Remove rows with missing, NA, or 'Other / None' values in specified columns
+covid_filtered <- covid_data_dates %>%
+  # Remove rows with NA values in the specified columns
+  filter(if_all(all_of(columns_to_check), ~ !is.na(.))) %>%
+  # Remove rows containing "None" or "Other" in the specified columns
+  filter(if_all(all_of(columns_to_check), ~ !(. %in% c("None", "Other", "other"))))
+
+# Create a new variable that is the horizontal sum of the symptom columns
+symptom_columns <- c("cough", "fever", "sore_throat", "shortness_of_breath", "head_ache")
+
+covid_filtered <- covid_filtered %>%
+  mutate(symptom_count = rowSums(select(., all_of(symptom_columns)), na.rm = TRUE))
+
+# Create factor variables for categorical columns
+categorical_columns <- c("cough", "fever", "sore_throat", "shortness_of_breath", "head_ache", "corona_result", "gender", "test_indication", "age_60_and_above")
+
+# Change binary columns to boolean
+binary_cols <- c('cough', 'fever', 'sore_throat','shortness_of_breath', 'head_ache')
+
+covid_filtered <- covid_filtered %>%
+  mutate(across(all_of(binary_cols), ~ ifelse(. == 1, "Yes", "No")))
+
+# Encode as factors
+covid_filtered[categorical_columns] <- lapply(covid_filtered[categorical_columns], as.factor)
+
+# Encode days of week as ordered factor levels
+covid_filtered <- covid_filtered %>%
+  mutate(
+    day_of_week = factor(day_of_week, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+  )
+
+# Drop date column
+covid_filtered <- dplyr::select(covid_filtered, -c(test_date))
+
+```
+
+
+# Exploratory Analysis
+
+We already had a glimpse of our data and we have some idea on how the dataset structure looks like and which variables are of our interest. Before proceeding with answering our exploratory questions, let us examine descriptive statistics within the sample.
+
+## Descriptive statistics
+
+```{r, warning=FALSE, echo=FALSE}
+summary(covid_filtered)
+```
+
+It is also important to know the share of positive test out of all tests done. Firstly, our prediction algorithm will focus primarily on positive results and having too few observations in relation to negative results will reduce performance for positive results. A very small percentage can also cause too few positive results in the test sample.
+
+```{r}
+infection_rate <- sum(covid_filtered$corona_result == "positive") / length(covid_filtered$corona_result) * 100
+
+print(paste("The positivity rate for this sample is:", round(infection_rate, 2), "%."))
+```
+
+#### Observations
+
+The summary statistics and the positivity rate show a few insights:
+
+- The symptoms and total number of symptoms are heavily skewed towards no symptoms
+- Negative results are also dominant
+- Together with positivity of 5.29% this can pose a significant issue for predicting positive results. Having too many negatives and no symptoms will not provide enough variance and bias the model towards negatives
+- Gender variable is balanced
+- Other demographic variables are also skewed but can provide value for the model
+
+
+### Q1: Which symptoms are most common among positively tested individuals, and do they differ from negatively tested individuals?
+
+
+The first question we ask, given our main predictive question, is whether and which symptoms are occurring between positively and negatively tested. While it might seem obvious, perhaps one of the symptoms is occurring as likely with negatively tested as with positively, because it is a symptom of cold and people wrongly assumed they had COVID and therefore would not have a predictive power on the COVID test result.
+
+To answer the question, we plot summary bar charts of to see how frequently a given symptom occurs between positive and negative COVID test results.
+
+```{r, warning=FALSE, echo=FALSE, fig.width=7, fig.height=5}
+
+# Create a copy of data
+symptoms <- covid_filtered
+
+# Symptom frequency for positive and negative cases
+symptom_frequency <- symptoms %>%
+    group_by(corona_result) %>%
+    summarize(
+        cough = sum(cough == "Yes"),
+        fever = sum(fever == "Yes"),
+        sore_throat = sum(sore_throat == "Yes"),
+        shortness_of_breath = sum(shortness_of_breath == "Yes"),
+        head_ache = sum(head_ache == "Yes")
+    ) %>%
+    gather(key = "symptom", value = "count", -corona_result)
+
+# Plot symptom frequency
+ggplot(symptom_frequency, aes(x = symptom, y = count, fill = corona_result)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Symptom Frequency by Test Result", x = "Symptom", y = "Freqency of Symptom")
+
+```
+
+#### Observations
+
+We can immediately see that cough and fever are such generic sickness symptoms, they can actually hinder our predictive performance if used alone. However, this opens up a the second question: while the symptoms alone can be misleading, what happens if they occur together? 
+
+### Q2: Does having at least two or three symptoms affect symptom occurrence between positive and negative tests?
+
+For this, we feature engineered variable called count of symptoms that indicates how many symptoms does the tested person have and we will plot the same chart for people with at least two and three symptoms.
+
+```{r, warning=FALSE, echo=FALSE, fig.width=7, fig.height=5}
+
+# Symptom frequency for positive and negative cases
+symptom_frequency <- symptoms %>%
+    filter(symptom_count >= 2) %>%
+    group_by(corona_result) %>%
+    summarize(
+        cough = sum(cough == "Yes"),
+        fever = sum(fever == "Yes"),
+        sore_throat = sum(sore_throat == "Yes"),
+        shortness_of_breath = sum(shortness_of_breath == "Yes"),
+        head_ache = sum(head_ache == "Yes")
+    ) %>%
+    gather(key = "symptom", value = "count", -corona_result)
+
+# Plot symptom frequency
+ggplot(symptom_frequency, aes(x = symptom, y = count, fill = corona_result)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Symptom Frequency by Test Result", x = "Symptom", y = "Freqency of Symptom")
+```
+
+Now let us do the same for at least 3 symptoms.
+
+```{r, warning=FALSE, echo=FALSE,fig.width=7, fig.height=5}
+# Symptom frequency for positive and negative cases
+symptom_frequency <- symptoms %>%
+    filter(symptom_count >= 3) %>%
+    group_by(corona_result) %>%
+    summarize(
+        cough = sum(cough == "Yes"),
+        fever = sum(fever == "Yes"),
+        sore_throat = sum(sore_throat == "Yes"),
+        shortness_of_breath = sum(shortness_of_breath == "Yes"),
+        head_ache = sum(head_ache == "Yes")
+    ) %>%
+    gather(key = "symptom", value = "count", -corona_result)
+
+# Plot symptom frequency
+ggplot(symptom_frequency, aes(x = symptom, y = count, fill = corona_result)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(title = "Symptom Frequency by Test Result", x = "Symptom", y = "Freqency of Symptom")
+```
+
+#### Observations
+
+This is clearly showing that the number of symptoms is very important! Therefore, our engineered variable `symptoms_count` will certainly be useful for the predictive task. It is an indication that positive test results will be better predicted when there is coexistence of symptoms. As an additional question, we can ask, what is the number of positive results per each count of symptoms? This chart will show it for us:
+
+```{r, warning=FALSE, echo=FALSE,fig.width=10, fig.height=5}
+# Summarize the number of cases per symptom count and test result
+symptom_summary_1 <- covid_filtered %>%
+  group_by(symptom_count, corona_result) %>%
+  summarize(count = n(), .groups = 'drop')
+
+# Create a bar chart
+plot_1 <- ggplot(symptom_summary_1, aes(x = as.factor(symptom_count), y = count, fill = corona_result)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Number of Test Results per Count of Symptoms",
+       x = "Count of Symptoms",
+       y = "Number of Test Results",
+       fill = "Test Result") +
+  theme_minimal()
+
+# Filter to include only positive test results
+positive_data <- covid_filtered %>%
+  filter(corona_result == "positive")
+
+# Summarize the number of positive cases per symptom count
+symptom_summary_2 <- positive_data %>%
+  group_by(symptom_count) %>%
+  summarize(count = n())
+
+# Create a bar chart
+plot_2 <- ggplot(symptom_summary_2, aes(x = as.factor(symptom_count), y = count)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Number of Positive Results per Count of Symptoms",
+       x = "Count of Symptoms",
+       y = "Number of Positive Results") +
+  theme_minimal()
+
+plot_grid(plot_1, plot_2, ncol = 2)
+```
+
+#### Observations
+
+While we see that count of symptoms is very important, it will not have a large effect on people who have 2 or less symptoms and together they form a majority of positive cases. We would probably need to count of other variables to be strong predictors of a positive test or accept there is no way to predict it in these categories. Another important observation is that a lot of positively-tested individuals have no symptoms! This will make it difficult to predict the test result only based on symptoms.
+
+### Q3: Do symptoms in positive results change over the days of the week?
+
+```{r, warning=FALSE, echo=FALSE,fig.width=7, fig.height=5}
+# Symptom frequency by day of week for positive cases
+symptom_day_frequency <- symptoms %>%
+  filter(corona_result == "positive") %>%
+  group_by(day_of_week) %>%
+  summarize(
+    cough = sum(cough == "Yes"),
+    fever = sum(fever == "Yes"),
+    sore_throat = sum(sore_throat == "Yes"),
+    shortness_of_breath = sum(shortness_of_breath == "Yes"),
+    head_ache = sum(head_ache == "Yes")
+  ) %>%
+  gather(key = "symptom", value = "count", -day_of_week)
+
+# Plot symptom frequency by day for positive cases
+ggplot(symptom_day_frequency, aes(x = day_of_week, y = count, fill = symptom)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Symptom Frequency by Day of Week (Positive Cases)", x = "Day of Week", y = "Count") +
+  theme_minimal()
+```
+
+#### Observations
+
+There is a clear weekdays pattern, in particular, we can see that symptoms frequency decreases on Fridays and Saturdays, likely caused by higher number of tests being conducted at the beginning of the week while doing less tests at the end. The ratio of symptoms seems to be similar across all weekdays. 
+
+### Q4: Do infection rates change over the days of the week?
+
+```{r, warning=FALSE, echo=FALSE,fig.width=7, fig.height=5}
+# Infection rates by day
+infection_rate_day<- covid_filtered %>%
+  group_by(day_of_week) %>%
+  summarize(
+    positive_count = sum(corona_result == "positive"),
+    total_count = n(),
+    infection_rate = positive_count / total_count * 100
+  )
+
+# Plot infection rates by season
+ggplot(infection_rate_day, aes(x = day_of_week, y = infection_rate)) +
+  geom_bar(stat = "identity", position = "dodge", fill='blue') +
+  labs(title = "Infection Rates by Day of Week", x = "Day of Week", y = "Infection Rate (%)") +
+  theme_minimal()
+```
+
+#### Observations
+
+The figure of positivity rate across days of week is showing only slight pattern that is consistent with the previous hypothesis - positiviy is higher at the beginning of the week, likely caused by a higher socialisation over the weekend. However, this would not explain higher rate on Saturdays, which could be caused by some people being sick but unable to be tested during the week. People being more sick and having a higher priority could explain this but we cannot infer this observation. 
+
+### Q5: Is the positivity rate different between age groups and genders?
+
+```{r, warning=FALSE, echo=FALSE, fig.width=7, fig.height=5}
+# Positivity rate by age group and gender
+positivity_age_gender <- covid_filtered %>%
+  group_by(age_60_and_above, gender) %>%
+  summarize(
+    positive_count = sum(corona_result == "positive"),
+    total_count = n(),
+    positivity_rate = positive_count / total_count * 100
+  )
+
+# Plot positivity rate by age group and gender
+ggplot(positivity_age_gender, aes(x = age_60_and_above, y = positivity_rate, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Positivity Rate by Age >60 and Gender", x = "Age >60", y = "Positivity Rate (%)") +
+  theme_minimal()
+```
+
+#### Observations
+
+There are several insights that we can infer from the chart above. Firstly, we can see that the positivity rate is significantly lower in both males and females of the 'None' gender group. Therefore, we can remove this value in the final tuned model. Even though it will reduce the number of observations by a large margin, it will remove many negative test results that are not so important. Furthermore, we can see that the positivity rate is higher for males, and also higher higher in those aged above 60 of both genders. This can provide valuable variance for the model.
+
+### Q6: Does the percentage of positive tests differ based on the reason for the test?
+
+```{r, warning=FALSE, echo=FALSE, fig.width=7, fig.height=5}
+# Positivity rate by reason to test
+positivity_reason <- covid_filtered %>%
+  group_by(test_indication) %>%
+  summarize(
+    positive_count = sum(corona_result == "positive"),
+    total_count = n(),
+    positivity_rate = positive_count / total_count * 100
+  )
+
+# Plot positivity rate by reason to test
+ggplot(positivity_reason, aes(x = test_indication, y = positivity_rate)) +
+  geom_bar(stat = "identity", position = "dodge", fill="blue") +
+  labs(title = "Positivity Rate by Test Indication", x = "Test Indication", y = "Positivity Rate (%)") + 
+  theme_minimal()
+```
+
+#### Observations
+
+As expected, the positivity rate for those who had contact with confirmed COVID-infected, will likely also test positive. The rate is tremendously high, above 70%. Travelling abroad gives marginal advantage over the rest of the reasons for testing. 
+
+## Summary
+
+There are a few points that can be carried into the predictive analysis:
+
+- Low number of symptoms and generic symptoms will likely not have strong predictive power.
+
+- Overall positivity is quite low which can bias the model, so a split containing a specific percentage of positively-tested will likely improve model performance.
+
+- Having more symptoms can likely be a strong predictor for positive test result. Unfortunately, the majority of positively-tested have less than two or no symptoms at all.
+
+- There could be some seasonality effects of the weekdays, but likely not so significant.
+
+- Age, gender and the reason for testing will likely lead to better model performance
+
+# Predictive Model
+
+Since this is a classification task, we will fit binary classification algorithms and evaluate them mainly by specificity, because we are most interested in predicting positive results. After comparing the models, we will fine-tune the best two models. Four machine learning algorithms were selected:
+
+1. **Logistic regression (baseline)**: Chosen for its simplicity and interpretability as a baseline model.
+2. **Random forest classifier**: Selected for its ability to handle high-dimensional data and capture non-linear relationships.
+3. **Boosting algorithm**: Utilised for its robustness in improving model accuracy by combining weak learners.
+4. **Neural Network**: Employed for its capacity to model complex patterns and interactions within the data.
+
+
+The following is the general approach in this part:
+
+1. Prepare data for the models
+2. Train the models
+3. Evaluate training and testing errors
+4. Compare models with f1 score
+5. Improve performance of the best model with:
+  - cross validation
+  - adding age variable
+  - hyper-parameter tuning
+  - using specific-share sample
+  
+
+## Preparing data 
+
+Because the share of positive tests in the sample is quite low, we need to ensure that both training and testing splits have the same distribution of positive / negative tests and we need to ensure that there is enough positive tests in relation to negative tests. Therefore we will create two datasets - stratified and a random sample merge (60% negatives and 40% positives) from both categories. Regular data will be used to select two best methods and a sample with specific share of positives will be used to fine tune the best model. We will use all available variables except `age_60_and_above`, because it contains many 'None' values and only an additional best performing model will utilise this dataset.
+
+```{r}
+# Make a copy of the dataset, age will be removed later
+covid_filtered_2 <- covid_filtered
+
+# Build a dataset with corona test result stratification
+set.seed(123)
+train_n <- createDataPartition(covid_filtered_2$corona_result, p = 0.7, list = FALSE) # createDataPartition has built in stratification
+covid_train <- covid_filtered_2[train_n, ]
+covid_test <- covid_filtered_2[-train_n, ]
+
+# Remove age
+covid_train_2 <- dplyr::select(covid_train, -c(age_60_and_above))
+covid_test_2 <- dplyr::select(covid_test, -c(age_60_and_above))
+
+# Build a dataset with a specific share of positive / negative results
+# Get number of positive
+positive_count <- covid_filtered_2 %>%
+  filter(corona_result == "positive") %>%
+  nrow()
+
+# Create dataset of positives
+positives <- covid_filtered_2 %>%
+  filter(corona_result == "positive")
+
+# Filter negatives
+negatives <- covid_filtered_2 %>%
+  filter(corona_result == "negative")
+
+# Create index of random negatives based on 60 % share of negatives in final sample
+share_negatives <- (positive_count / 0.4 - positive_count) / (positive_count + nrow(negatives))
+index_negatives <- sample(1:nrow(negatives), round(nrow(negatives) * share_negatives))
+
+# Subset negatives
+negatives <- negatives[index_negatives,]
+
+# Merge datasets and create train / test splits
+merged <- rbind(positives, negatives)
+covid_train_6_4_n <- initial_split(merged, prop = 0.7, strata = "corona_result")
+covid_train_6_4 <- training(covid_train_6_4_n)
+covid_test_6_4 <- testing(covid_train_6_4_n)
+```
+
+```{r}
+# We can check stratification and specific stratification sampling
+table(covid_train$corona_result) %>% prop.table()
+table(covid_test$corona_result) %>% prop.table()
+
+table(covid_train_6_4$corona_result) %>% prop.table()
+table(covid_test_6_4$corona_result) %>% prop.table()
+```
+
+The same data preparation process is repeated for data containing only symptoms to explore the first predictive question:
+
+```{r}
+# Select columns
+covid_symptoms <- dplyr::select(covid_filtered, c(cough, fever, sore_throat, shortness_of_breath, head_ache, corona_result))
+
+# Build a dataset with corona test result stratification
+set.seed(123)
+sympt_train_n <- createDataPartition(covid_symptoms$corona_result, p = 0.7, list = FALSE) # createDataPartition has built in stratification
+sympt_train <- covid_symptoms[sympt_train_n, ]
+sympt_test <- covid_symptoms[-sympt_train_n, ]
+
+# Build a dataset with a specific share of positive / negative results
+# Get number of positive
+positive_count <- covid_symptoms %>%
+  filter(corona_result == "positive") %>%
+  nrow()
+
+# Create dataset of positives
+positives <- covid_symptoms %>%
+  filter(corona_result == "positive")
+
+# Filter negatives
+negatives <- covid_symptoms %>%
+  filter(corona_result == "negative")
+
+# Create index of random negatives based on 60 % share of negatives in final sample
+share_negatives <- (positive_count / 0.4 - positive_count) / (positive_count + nrow(negatives))
+index_negatives <- sample(1:nrow(negatives), round(nrow(negatives) * share_negatives))
+
+# Subset negatives
+negatives <- negatives[index_negatives,]
+
+# Merge datasets and create train / test splits
+merged <- rbind(positives, negatives)
+symptoms_train_6_4_n <- initial_split(merged, prop = 0.7, strata = "corona_result")
+sympt_train_6_4 <- training(symptoms_train_6_4_n)
+sympt_test_6_4 <- testing(symptoms_train_6_4_n)
+```
+
+```{r}
+# We can check stratification and specific stratification sampling
+table(sympt_train$corona_result) %>% prop.table()
+table(sympt_test$corona_result) %>% prop.table()
+
+table(sympt_train_6_4$corona_result) %>% prop.table()
+table(sympt_test_6_4$corona_result) %>% prop.table()
+```
+
+## Training and evaluating models
+
+Now, we can train our models and evaluate their performance.
+
+### Logistic Regression
+
+Let us start with training the baseline model - logistic regression, with only symptoms being the predictors to answer our first predictive question. These models will not be fine tuned, as the exploratory analysis suggested having up to 2 symptoms is a pooor predictor of a positive result and majority of the sample has up to 2 symptoms.
+
+#### Symptoms models
+
+Firstly, a basic model on a normal stratified sample is fit, followed by a fit on the specific share sample.
+
+```{r}
+set.seed(123)
+# Fit symptoms model and predict 
+log_sympt <- glm(corona_result ~ ., data = sympt_train, family = binomial)
+sympt_num_pred <- predict(log_sympt, newdata = sympt_test, type = "response")
+sympt_pred <-  as.factor(ifelse(sympt_num_pred > 0.5, "positive", "negative") )
+
+# Fit the split symptoms model and predict 
+log_sympt_split <- glm(corona_result ~ ., data = sympt_train_6_4, family = binomial)
+sympt_split_num_pred <- predict(log_sympt_split, newdata = sympt_test_6_4, type = "response")
+sympt_split_pred <-  as.factor(ifelse(sympt_split_num_pred > 0.5, "positive", "negative") )
+
+# Evaluate performance
+conf_matrix_sympt <- confusionMatrix(sympt_pred, sympt_test$corona_result, positive="positive")
+conf_matrix_sympt_split <- confusionMatrix(sympt_split_pred, sympt_test_6_4$corona_result, positive="positive")
+
+```
+
+Now, checking the results:
+
+```{r}
+conf_matrix_sympt
+```
+
+```{r}
+conf_matrix_sympt_split
+```
+
+#### Observations
+
+There are some interesting insights evident from the symptoms logistic models. Firstly, it is clear that we can reject our first predictive hypothesis that positive covid tests can be predicted only from symptoms. Sensitivity results of 24.71% and 47.38 % are too low for successful prediction. Secondly, the first model is remarkably accurate on negative predictions (specificity), the performance of the second model drops slightly but is still good. Lastly, it is evident that splitting the sample into specific strata significantly improves our target metric - sensitivity (recall). This is a valuable insight for fine-tuning the main model.
+
+### All variables models (excluding age)
+
+```{r}
+set.seed(123)
+# Fit the model and predict 
+log_model <- glm(corona_result ~ ., data = covid_train_2, family = binomial)
+log_num_pred <- predict(log_model, newdata = covid_test_2, type = "response")
+log_pred <-  as.factor(ifelse(log_num_pred > 0.5, "positive", "negative") )
+
+# Evaluate performance
+conf_matrix_log <- confusionMatrix(log_pred, covid_test_2$corona_result, positive="positive")
+
+conf_matrix_log
+```
+
+
+```{r}
+summary(log_model)
+```
+
+#### Random Forest Classifier
+
+```{r}
+set.seed(123)
+# Fit model and predict
+rf_model <- randomForest(corona_result ~ ., data = covid_train_2, importance = TRUE)
+# Predict on test set
+rf_pred <- predict(rf_model, newdata = covid_test_2)
+
+# Evaluate performance
+conf_matrix_rf <- confusionMatrix(rf_pred, covid_test_2$corona_result, positive="positive")
+
+conf_matrix_rf
+```
+
+
+### XGBoost Classifier
+
+```{r}
+set.seed(123)
+
+# Ensure that the predictor columns are numeric and exclude the target column
+train_data <- covid_train_2[, -which(names(covid_train_2) == "corona_result")]
+test_data <- covid_test_2[, -which(names(covid_test_2) == "corona_result")]
+
+# Convert all predictors to numeric (if necessary)
+train_data <- data.frame(lapply(train_data, as.numeric))
+test_data <- data.frame(lapply(test_data, as.numeric))
+
+# Convert the target variable to numeric (0 for negative, 1 for positive)
+train_labels <- as.numeric(covid_train_2$corona_result) - 1  # 0 = negative, 1 = positive
+test_labels <- as.numeric(covid_test_2$corona_result) - 1
+
+# Convert the data to DMatrix format (required by xgboost)
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_labels)
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = test_labels)
+
+# Fit the XGBoost model
+xgb_model <- xgboost(data = dtrain, 
+                     nrounds = 100, 
+                     objective = "binary:logistic", 
+                     eval_metric = "logloss", 
+                     max_depth = 6, 
+                     eta = 0.3, 
+                     verbose = 0)
+
+# Make predictions on the test set
+xgb_pred_prob <- predict(xgb_model, newdata = dtest)  # Predicted probabilities
+xgb_pred <- ifelse(xgb_pred_prob > 0.5, "positive", "negative")  # Convert probabilities to class labels
+
+# Evaluate performance
+conf_matrix_xgb <- confusionMatrix(factor(xgb_pred, levels = c("negative", "positive")), factor(covid_test_2$corona_result, levels = c("negative", "positive")), positive = "positive")
+
+conf_matrix_xgb
+
+```
+
+
+### Neural net
+
+Since there is only one numerical feature in the model, it is not needed to normalise the variables that are encoded as factor levels. 
+
+
+```{r}
+set.seed(123)
+
+# Prepare the data for training (excluding the target variable)
+train_data <- covid_train_2[, -which(names(covid_train_2) == "corona_result")]
+test_data <- covid_test_2[, -which(names(covid_test_2) == "corona_result")]
+
+# Convert all predictors to numeric (if necessary)
+train_data <- data.frame(lapply(train_data, as.numeric))
+test_data <- data.frame(lapply(test_data, as.numeric))
+
+# Convert the target variable to numeric (0 for negative, 1 for positive)
+train_labels <- as.factor(covid_train_2$corona_result)  # Factor labels
+test_labels <- as.factor(covid_test_2$corona_result)
+
+# Fit a Neural Network model
+nn_model <- nnet(corona_result ~ ., data = covid_train_2, size = 10, maxit = 500, linout = FALSE, trace=FALSE)
+
+# Make predictions
+nn_pred <- predict(nn_model, newdata = covid_test_2, type = "class")
+
+# Evaluate performance
+conf_matrix_nn <- confusionMatrix(as.factor(nn_pred), test_labels, positive="positive")
+
+conf_matrix_nn
+```
+
+## Compare performance of models
+
+Now, an important step is to evaluate all models.
+
+```{r}
+
+# Extract metrics
+metrics_log <- conf_matrix_log$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+metrics_rf <- conf_matrix_rf$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+metrics_xgb <- conf_matrix_xgb$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+metrics_nn <- conf_matrix_nn$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+
+# Combine into a data frame
+metrics_df <- data.frame(
+  Model = c('Logistic Regression', 'Random Forest', 'XGBoost', 'Neural Net'),
+  Sensitivity = c(metrics_log['Sensitivity'], metrics_rf['Sensitivity'], metrics_xgb['Sensitivity'], metrics_nn['Sensitivity']),
+  Specificity = c(metrics_log['Specificity'], metrics_rf['Specificity'], metrics_xgb['Specificity'], metrics_nn['Specificity']),
+  Precision = c(metrics_log['Precision'], metrics_rf['Precision'], metrics_xgb['Precision'], metrics_nn['Precision']),
+  F1 = c(metrics_log['F1'], metrics_rf['F1'], metrics_xgb['F1'], metrics_nn['F1'])
+)
+
+metrics_df
+```
+
+The table shows that logistic regression, the baseline model is the best-performing model in terms of sensitivity and F1 score. While its precision is lower, it is largely driven by scoring lower in specificity and we are not interested in a model that can predict uninteresting negative test results. The second best model is XGBoost. Therefore, logistic regression and XGBoost models will be tested against a specific strata sample and the better-performing out of the two will be fine-tuned.
+
+## Improving performance of the best models
+
+The first step is to train and compare the two models on the sample with 60% negative and 40% positive results. This sample also includes the age variable.
+
+```{r}
+set.seed(123)
+# Logistic Regression
+# Fit the model and predict 
+log_model_st <- glm(corona_result ~ ., data = covid_train_6_4, family = binomial)
+log_num_pred_st <- predict(log_model_st, newdata = covid_test_6_4, type = "response")
+log_pred_st <-  as.factor(ifelse(log_num_pred_st > 0.5, "positive", "negative") )
+
+# Evaluate performance
+conf_matrix_log_st <- confusionMatrix(log_pred_st, covid_test_6_4$corona_result, positive="positive")
+
+# XGBoost
+# Ensure that the predictor columns are numeric and exclude the target column
+train_data <- covid_train_6_4[, -which(names(covid_train_6_4) == "corona_result")]
+test_data <- covid_test_6_4[, -which(names(covid_test_6_4) == "corona_result")]
+
+# Convert all predictors to numeric (if necessary)
+train_data <- data.frame(lapply(train_data, as.numeric))
+test_data <- data.frame(lapply(test_data, as.numeric))
+
+# Convert the target variable to numeric (0 for negative, 1 for positive)
+train_labels <- as.numeric(covid_train_6_4$corona_result) - 1  # 0 = negative, 1 = positive
+test_labels <- as.numeric(covid_test_6_4$corona_result) - 1
+
+# Convert the data to DMatrix format (required by xgboost)
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_labels)
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = test_labels)
+
+# Fit the XGBoost model
+xgb_model_st <- xgboost(data = dtrain, 
+                     nrounds = 100, 
+                     objective = "binary:logistic", 
+                     eval_metric = "logloss", 
+                     max_depth = 6, 
+                     eta = 0.3, 
+                     verbose = 0)
+
+# Make predictions on the test set
+xgb_pred_prob_st <- predict(xgb_model_st, newdata = dtest)  # Predicted probabilities
+xgb_pred_st <- ifelse(xgb_pred_prob_st > 0.5, "positive", "negative")  # Convert probabilities to class labels
+
+# Evaluate performance
+conf_matrix_xgb_st <- confusionMatrix(factor(xgb_pred_st, levels = c("negative", "positive")), factor(covid_test_6_4$corona_result, levels = c("negative", "positive")), positive = "positive")
+
+# Compare performance
+metrics_log_st <- conf_matrix_log_st$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+metrics_xgb_st <- conf_matrix_xgb_st$byClass[c('Sensitivity', 'Specificity', 'Precision', 'F1')]
+
+# Combine into a data frame
+metrics_st <- data.frame(
+  Model = c('Logistic Regression', 'XGBoost'),
+  Sensitivity = c(metrics_log_st['Sensitivity'], metrics_xgb_st['Sensitivity']),
+  Specificity = c(metrics_log_st['Specificity'], metrics_xgb_st['Specificity']),
+  Precision = c(metrics_log_st['Precision'], metrics_xgb_st['Precision']),
+  F1 = c(metrics_log_st['F1'], metrics_xgb_st['F1'])
+)
+
+metrics_st
+
+```
+
+The table is showing significant improvements, especially for the XGBoost model. Therefore, we will only continue with this model and tune model hyperparameters and use cross-validation to improve its performance.
+
+```{r}
+# Define the tuning grid
+tune_grid <- expand.grid(
+  nrounds = 100,            # Number of boosting rounds
+  max_depth = c(4, 6, 8),           # Maximum depth of a tree
+  eta = c(0.01, 0.1, 0.3),          # Learning rate
+  gamma = c(0, 0.5),           # Minimum loss reduction
+  colsample_bytree = c(0.75,1),     # Subsample ratio of columns
+  min_child_weight = c(1,5,10),    # Minimum sum of instance weight (hessian) needed in a child
+  subsample = c(0.75, 1)        # Subsample ratio of the training instance
+)
+
+# Define the control for cross-validation with custom summary function
+control <- trainControl(
+  method = "cv",                    # Cross-validation
+  number = 5,                       # Number of folds
+  verboseIter = FALSE,               # Verbose output
+  allowParallel = TRUE,             # Allow parallel computation
+)
+
+# Start timer
+start_time <- Sys.time()
+
+# Train the XGBoost model with hyperparameter tuning
+set.seed(123)
+xgb_tune <- train(
+  x = train_data,
+  y = factor(train_labels, levels = c(0, 1), labels = c("negative", "positive")),
+  method = "xgbTree",
+  trControl = control,
+  tuneGrid = tune_grid,
+  metric = "Accuracy"
+)
+
+# Stop timer
+end_time <- Sys.time()
+
+# Calculate time taken
+time_taken <- end_time - start_time
+time_taken
+xgb_tune$bestTune
+```
+
+
+```{r}
+# Make predictions on the test set using the best tuned model
+xgb_pred_prob_tuned <- predict(xgb_tune, newdata = test_data, type = "prob")[,2]  # Predicted probabilities
+xgb_pred_tuned <- ifelse(xgb_pred_prob_tuned > 0.5, "positive", "negative")  # Convert probabilities to class labels
+
+# Evaluate performance
+conf_matrix_xgb_tuned <- confusionMatrix(factor(xgb_pred_tuned, levels = c("negative", "positive")), factor(covid_test_6_4$corona_result, levels = c("negative", "positive")), positive = "positive")
+
+conf_matrix_xgb_tuned
+```
+
+As we can see, the tuning did not help the model, in fact, sensitivity decreased a bit. Therefore, we can conclude that the previous model has the best performance. Before we make conclusions, let's check which features are the most impactful for successful prediction.
+
+```{r,fig.width=7, fig.height=5}
+# Extract feature importance
+importance_matrix <- xgb.importance(model = xgb_tune$finalModel)
+
+# Convert to tibble for easy manipulation
+covid_features <- as_tibble(importance_matrix)
+
+# Plot feature importance
+covid_features %>%
+  ggplot(aes(y = reorder(Feature, Gain), x = Gain)) +
+  geom_col(width = 0.04) +
+  geom_point(size = 2) +
+  theme_bw() +
+  labs(x = "Relative Influence", y = "Features", title = "Importance of Features for COVID-19 Test Result Prediction")
+```
+
+An interesting comparison with the final logistic regression model:
+
+```{r}
+summary(log_model_st)
+```
+
+Interestingly, logistic regression puts slightly different importance on some variables (individual symptoms) while XGBoost model relies heavily on the reason for testing and symptom count.
+
+### Observations
+
+The last part of the analysis provided answers to the predictive questions. The first predictive question can be rejected, as none of the models using only symptoms as predictors led to good-enough predictions. These simple models excelled at predicting negatives but contained too many false positives. Then, we saw that additional variables and creating a sample with specific share of positives led to significant improvements in the models, so the second hypothesis is confirmed, however, the sensitivity of all the models was only 76.7% for the best model. Tuning model hyperparameters and utilising cross-validation did not yield performance improvements. The last predictive hypothesis can also be rejected, because both final models give low significance to the predictive power of seasonality (day of the week).
+
+# Conclusions
+
+Overall, the predictive model can be considered a moderate success. While the performance did not reach satisfactory numbers, the analysis proved significant improvements over the baseline models. The conclusions are:
+
+- Exploratory analysis showed number of symptoms and reason for testing being the best predictors, which proved correct in the exploratory part.
+
+- Individual symptoms cannot be used to predict COVID test results. By adding demographic variables and changing the ratio of positive results, model performance in sensitivity can be improved up to 76% with a boosting algorithm. Hyperparameter tuning and cross validation does not yield improvements.
+
+- There is a certain threshold as many infected individuals show no signs of sickness and prediction thus relies only on the reason for testing which can be limited.
+
+- Further improvements can be explored by testing other splits of negative/positive results, engineering polynomial and high-dimensional features (such as all possible interaction combinatons of symptoms), which were outside of the scope of this analysis.
+
+# References
+
+Gareth, J., Witten, D., Hastie, T., Tibshirani, R. 2021. *An Introduction to Statistical Learning with Applications in R*. New York, NY:Spinger. pp.497-532
+
+Hastie, T., Tibshirani, R., Friedman, J. 2009. *The Elements of Statistical Learning*. 2nd ed. New York, NY:Spinger.
+
+Kashnitsky, Y., 2023a. *Classification, Decision Trees and k Nearest Neighbors* [Online]. Available from: <https://mlcourse.ai/book/topic03/topic03_decision_trees_kNN.html> [Accessed on December 14, 2024]
+
+Kashnitsky, Y., 2023b. *Exploratory Data Analysis with Pandas* [Online]. Available from: <https://mlcourse.ai/book/topic01/topic01_pandas_data_analysis.html> [Accessed on December 13, 2024]
+
+Kravchenko, A. 2023. *Feature Engineering and Feature Selection* [Online]. Available from: <https://mlcourse.ai/book/topic06/topic6_feature_engineering_feature_selection.html> [Accessed on December 14, 2024]
+
+Lantz, B. 2015. *Machine Learning with R - Discover How to Build Machine Learning Algorithms, Prepare Data, and Dig Deep into Data Prediction Techniques with R*. 2nd edn. Birmingham: Packt Publishing.
+
+Natekin, A. 2023. *Gradient Boosting* [Online]. Available from: <https://mlcourse.ai/book/topic10/topic10_gradient_boosting.html> [Accessed on December 14, 2024]
+
+Polusmak, E., 2023. *Visual Data Analysis.*[Online] Available from: <https://mlcourse.ai/book/topic02/topic02_visual_data_analysis.html> [Accessed on October 13, 2024]
+
